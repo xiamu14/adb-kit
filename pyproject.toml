@@ -1,10 +1,7 @@
 [project]
-name = "adb-qr"
+name = "adb-wifi"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-    "qrcode>=8.2",
-    "zeroconf>=0.148.0",
-]
+dependencies = ["qrcode>=8.2", "zeroconf>=0.148.0"]

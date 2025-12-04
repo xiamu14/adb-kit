@@ -5,6 +5,9 @@
     "**/.hg": true,
     "**/.DS_Store": true,
     "**/Thumbs.db": true,
+    "**/flutter/ephemeral": true,
+    "**/.symlinks": true,
+    "**/.plugin_symlinks": true,
     "**/*.blob": true,
     "**/*.csproj": true
   },
