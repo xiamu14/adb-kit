@@ -34,6 +34,8 @@ FORMAT_QR = "WIFI:T:ADB;S:%s;P:%s;;"
 CMD_PAIR = "adb pair %s:%s %s"
 CMD_CONNECT = "adb connect %s:%s"
 CMD_DEVICES = "adb devices -l"
+CMD_REVERSE = "adb -s %s reverse tcp:8081 tcp:8081"
+CMD_RESTART = "adb kill-server && adb start-server"
 
 
 class ADBListener:
@@ -151,8 +153,80 @@ def display_qr_code(text):
     )
     qr.add_data(text)
     qr.make(fit=True)
-    
+
     qr.print_ascii(invert=True)
+
+
+def get_connected_devices():
+    """Get list of connected ADB devices."""
+    result = subprocess.run("adb devices", shell=True, capture_output=True, text=True)
+    devices = []
+    for line in result.stdout.strip().split('\n')[1:]:
+        if line.strip() and 'device' in line:
+            device_id = line.split()[0]
+            devices.append(device_id)
+    return devices
+
+
+def select_device(devices):
+    """Let user select a device from the list."""
+    if not devices:
+        print(f"{Colors.RED}No connected devices found{Colors.RESET}")
+        return None
+
+    if len(devices) == 1:
+        print(f"{Colors.GREEN}Using device: {devices[0]}{Colors.RESET}")
+        return devices[0]
+
+    print(f"\n{Colors.BOLD}Connected devices:{Colors.RESET}")
+    for i, device in enumerate(devices, 1):
+        print(f"  {Colors.BLUE}{i}{Colors.RESET}. {device}")
+
+    try:
+        choice = input(f"\n{Colors.BOLD}Select device (1-{len(devices)}): {Colors.RESET}").strip()
+        idx = int(choice) - 1
+        if 0 <= idx < len(devices):
+            return devices[idx]
+        else:
+            print(f"{Colors.RED}Invalid selection{Colors.RESET}")
+            return None
+    except (ValueError, KeyboardInterrupt):
+        print(f"\n{Colors.RED}Cancelled{Colors.RESET}")
+        return None
+
+
+def run_reverse():
+    """Run adb reverse command for selected device."""
+    print(f"\n{Colors.BOLD}=== ADB Reverse ==={Colors.RESET}\n")
+
+    devices = get_connected_devices()
+    device = select_device(devices)
+
+    if not device:
+        return
+
+    cmd = CMD_REVERSE % device
+    print(f"\n{Colors.YELLOW}Running: {cmd}{Colors.RESET}\n")
+
+    result = subprocess.run(cmd, shell=True)
+
+    if result.returncode == 0:
+        print(f"{Colors.GREEN}✓ Reverse port mapping established{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}✗ Reverse failed{Colors.RESET}")
+
+
+def run_restart():
+    """Restart ADB server."""
+    print(f"\n{Colors.BOLD}=== ADB Restart ==={Colors.RESET}\n")
+    print(f"{Colors.YELLOW}Running: {CMD_RESTART}{Colors.RESET}\n")
+
+    result = subprocess.run(CMD_RESTART, shell=True)
+
+    if result.returncode == 0:
+        print(f"{Colors.GREEN}✓ ADB server restarted{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}✗ Restart failed{Colors.RESET}")
 
 
 def main():
@@ -167,12 +241,20 @@ def main():
             mode = "connect"
         elif arg in ["-p", "--pair-connect"]:
             mode = "pair-connect"
+        elif arg in ["-s", "--reverse"]:
+            run_reverse()
+            return
+        elif arg in ["-r", "--restart"]:
+            run_restart()
+            return
         elif arg in ["-h", "--help"]:
             print(f"\n{Colors.BOLD}ADB Wireless Debug Helper{Colors.RESET}")
             print("\nUsage: python main.py [OPTIONS]")
             print("\nOptions:")
             print(f"  {Colors.GREEN}-p, --pair-connect{Colors.RESET}  Scan QR to pair, then connect (default)")
             print(f"  {Colors.BLUE}-c, --connect{Colors.RESET}       Scan QR to get IP, then connect (for paired devices)")
+            print(f"  {Colors.YELLOW}-s, --reverse{Colors.RESET}       Setup reverse port (tcp:8081) for selected device")
+            print(f"  {Colors.YELLOW}-r, --restart{Colors.RESET}       Restart ADB server (kill-server && start-server)")
             print(f"  {Colors.YELLOW}-h, --help{Colors.RESET}          Show this help message")
             return
 
