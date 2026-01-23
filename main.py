@@ -229,6 +229,12 @@ def run_restart():
         print(f"{Colors.RED}✗ Restart failed{Colors.RESET}")
 
 
+def run_devices():
+    """List connected devices."""
+    print(f"\n{Colors.BOLD}=== Connected Devices ==={Colors.RESET}\n")
+    subprocess.run(CMD_DEVICES, shell=True)
+
+
 def main():
     import sys
 
@@ -247,6 +253,9 @@ def main():
         elif arg in ["-r", "--restart"]:
             run_restart()
             return
+        elif arg in ["-d", "--devices"]:
+            run_devices()
+            return
         elif arg in ["-h", "--help"]:
             print(f"\n{Colors.BOLD}ADB Wireless Debug Helper{Colors.RESET}")
             print("\nUsage: python main.py [OPTIONS]")
@@ -255,6 +264,7 @@ def main():
             print(f"  {Colors.BLUE}-c, --connect{Colors.RESET}       Scan QR to get IP, then connect (for paired devices)")
             print(f"  {Colors.YELLOW}-s, --reverse{Colors.RESET}       Setup reverse port (tcp:8081) for selected device")
             print(f"  {Colors.YELLOW}-r, --restart{Colors.RESET}       Restart ADB server (kill-server && start-server)")
+            print(f"  {Colors.GREEN}-d, --devices{Colors.RESET}       List connected devices")
             print(f"  {Colors.YELLOW}-h, --help{Colors.RESET}          Show this help message")
             return
 
