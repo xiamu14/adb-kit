@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local generated QR pages
+.cache/
+.DS_Store
