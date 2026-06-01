@@ -15,9 +15,12 @@ import subprocess
 import tempfile
 import threading
 import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from queue import Empty, Queue
+from urllib.parse import parse_qs
 
 import qrcode
 import qrcode.image.svg
@@ -59,6 +62,7 @@ class ADBListener:
         zeroconf_instance=None,
         qr_code_path=None,
         qr_code_cleanup_timer=None,
+        browser_session=None,
     ):
         self.mode = mode  # "pair-connect" or "connect"
         self.device_ip = None
@@ -66,6 +70,8 @@ class ADBListener:
         self.done = False
         self.qr_code_path = qr_code_path
         self.qr_code_cleanup_timer = qr_code_cleanup_timer
+        self.browser_session = browser_session
+        self.lock = threading.Lock()
 
     def remove_service(self, zeroconf, type, name):
         pass
@@ -74,6 +80,10 @@ class ADBListener:
         pass
 
     def add_service(self, zeroconf, type, name):
+        with self.lock:
+            if self.done or self.device_ip:
+                return
+
         info = zeroconf.get_service_info(type, name)
         if not info:
             return
@@ -91,6 +101,8 @@ class ADBListener:
             print(f"{Colors.BLUE}IP Address: {ip_address}{Colors.RESET}")
 
         self.device_ip = ip_address or info.server
+        if self.browser_session:
+            self.browser_session.set_device_found(self.device_ip)
 
         if self.mode == "pair-connect":
             self.pair_then_connect(info, ip_address)
@@ -103,6 +115,8 @@ class ADBListener:
 
         cmd = CMD_PAIR % (info.server, info.port, PASS)
         print(f"{Colors.YELLOW}Pairing...{Colors.RESET}\n")
+        if self.browser_session:
+            self.browser_session.set_pairing()
         sys.stdout.flush()
 
         result = subprocess.run(cmd, shell=True)
@@ -116,14 +130,24 @@ class ADBListener:
             print(
                 f"{Colors.BLUE}Ready to connect to: {ip_address or info.server}{Colors.RESET}\n"
             )
+            if self.browser_session:
+                self.browser_session.set_paired(ip_address or info.server)
             sys.stdout.flush()
             self.prompt_connect(ip_address or info.server)
         else:
             print(f"\n{Colors.RED}✗ Pairing failed{Colors.RESET}")
+            if self.browser_session:
+                self.browser_session.set_error("Pairing failed")
+            self.done = True
+            if self.zeroconf:
+                self.zeroconf.close()
 
     def connect_only(self, info, ip_address):
         """Connect to already paired device (only IP available from QR scan)"""
-        self.prompt_connect(ip_address or info.server)
+        ip = ip_address or info.server
+        if self.browser_session:
+            self.browser_session.set_ready_to_connect(ip)
+        self.prompt_connect(ip)
 
     def prompt_connect(self, ip):
         """Prompt user for connect port and execute adb connect"""
@@ -136,13 +160,21 @@ class ADBListener:
             sys.stdout.flush()
             sys.stderr.flush()
 
-            port = input(
-                f"{Colors.BOLD}Enter connect port (default 5555): {Colors.RESET}"
-            ).strip()
+            if self.browser_session:
+                print(
+                    f"{Colors.BOLD}Enter connect port in the browser page (default 5555).{Colors.RESET}"
+                )
+                port = self.browser_session.wait_for_connect_port()
+            else:
+                port = input(
+                    f"{Colors.BOLD}Enter connect port (default 5555): {Colors.RESET}"
+                ).strip()
             if not port:
                 port = "5555"
 
             print(f"\n{Colors.YELLOW}Connecting to {ip}:{port}...{Colors.RESET}\n")
+            if self.browser_session:
+                self.browser_session.set_connecting(ip, port)
             sys.stdout.flush()
 
             cmd = CMD_CONNECT % (ip, port)
@@ -153,12 +185,16 @@ class ADBListener:
 
             if result.returncode == 0:
                 print(f"{Colors.GREEN}✓ Connected successfully{Colors.RESET}\n")
+                if self.browser_session:
+                    self.browser_session.set_connected()
                 if self.qr_code_path:
                     if self.qr_code_cleanup_timer:
                         self.qr_code_cleanup_timer.cancel()
                     delete_qr_code_file(self.qr_code_path)
             else:
                 print(f"{Colors.RED}✗ Connection failed{Colors.RESET}\n")
+                if self.browser_session:
+                    self.browser_session.set_error("Connection failed")
 
             # Mark as done and close zeroconf
             self.done = True
@@ -167,6 +203,8 @@ class ADBListener:
 
         except KeyboardInterrupt:
             print(f"\n{Colors.RED}Cancelled{Colors.RESET}\n")
+            if self.browser_session:
+                self.browser_session.set_error("Cancelled")
             self.done = True
             if self.zeroconf:
                 self.zeroconf.close()
@@ -205,12 +243,11 @@ def delete_file_later(path, delay_seconds=QR_CACHE_TTL_SECONDS):
     return timer
 
 
-def display_qr_code_browser(text, ttl_seconds=QR_CACHE_TTL_SECONDS):
-    """Generate a QR code page and open it in a new browser window."""
+def build_qr_svg(text, box_size=12):
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=12,
+        box_size=box_size,
         border=4,
     )
     qr.add_data(text)
@@ -219,7 +256,364 @@ def display_qr_code_browser(text, ttl_seconds=QR_CACHE_TTL_SECONDS):
     image = qr.make_image(image_factory=qrcode.image.svg.SvgPathImage)
     svg_buffer = BytesIO()
     image.save(svg_buffer)
-    qr_svg = svg_buffer.getvalue().decode("utf-8")
+    return svg_buffer.getvalue().decode("utf-8")
+
+
+class BrowserPairingSession:
+    """Small local browser UI for QR display and connect-port entry."""
+
+    def __init__(self, text):
+        self.text = text
+        self.qr_svg = build_qr_svg(text)
+        self.port_queue = Queue(maxsize=1)
+        self.lock = threading.Lock()
+        self.state = {
+            "status": "waiting",
+            "message": "Scan the QR code on your Android device.",
+            "deviceIp": "",
+            "canSubmit": False,
+            "done": False,
+            "error": "",
+        }
+        self.server = None
+        self.thread = None
+
+    def start(self):
+        session = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                if self.path.startswith("/state"):
+                    self.send_json(session.snapshot())
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(session.render_html().encode("utf-8"))
+
+            def do_POST(self):
+                if not self.path.startswith("/connect"):
+                    self.send_error(404)
+                    return
+
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                port = parse_qs(body).get("port", [""])[0].strip() or "5555"
+                session.submit_port(port)
+                self.send_json({"ok": True})
+
+            def send_json(self, payload):
+                import json
+
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            name="adb-browser-session",
+            daemon=True,
+        )
+        self.thread.start()
+        return f"http://127.0.0.1:{self.server.server_port}/"
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.state)
+
+    def update(self, **changes):
+        with self.lock:
+            self.state.update(changes)
+
+    def set_device_found(self, ip):
+        self.update(
+            status="device_found",
+            message="Device found. Pairing now...",
+            deviceIp=ip,
+        )
+
+    def set_pairing(self):
+        self.update(status="pairing", message="Pairing with ADB...")
+
+    def set_paired(self, ip):
+        self.update(
+            status="paired",
+            message="Paired successfully. Enter the connect port.",
+            deviceIp=ip,
+            canSubmit=True,
+        )
+
+    def set_ready_to_connect(self, ip):
+        self.update(
+            status="ready",
+            message="Device found. Enter the connect port.",
+            deviceIp=ip,
+            canSubmit=True,
+        )
+
+    def set_connecting(self, ip, port):
+        self.update(
+            status="connecting",
+            message=f"Connecting to {ip}:{port}...",
+            canSubmit=False,
+        )
+
+    def set_connected(self):
+        self.update(
+            status="connected",
+            message="Connected successfully. Closing this page...",
+            canSubmit=False,
+            done=True,
+        )
+
+    def set_error(self, message):
+        self.update(status="error", message=message, error=message, canSubmit=False)
+
+    def submit_port(self, port):
+        try:
+            self.port_queue.put_nowait(port)
+        except Exception:
+            pass
+        self.update(canSubmit=False, message="Port submitted. Connecting...")
+
+    def wait_for_connect_port(self):
+        self.update(canSubmit=True)
+        while True:
+            try:
+                return self.port_queue.get(timeout=0.5)
+            except Empty:
+                state = self.snapshot()
+                if state.get("done") or state.get("error"):
+                    raise KeyboardInterrupt
+
+    def render_html(self):
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ADB Wireless Debug</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    body {{
+      background: #f5f7fb;
+      color: #172033;
+      margin: 0;
+      min-height: 100vh;
+    }}
+    main {{
+      align-items: center;
+      display: grid;
+      gap: 22px;
+      grid-template-columns: minmax(280px, 520px) minmax(280px, 380px);
+      justify-content: center;
+      min-height: 100vh;
+      padding: 32px;
+    }}
+    h1 {{
+      font-size: 28px;
+      font-weight: 700;
+      margin: 0;
+    }}
+    .qr {{
+      background: #ffffff;
+      border: 1px solid #d9e0ec;
+      border-radius: 8px;
+      box-shadow: 0 18px 60px rgba(23, 32, 51, 0.16);
+      padding: 24px;
+    }}
+    .qr svg {{
+      display: block;
+      height: min(70vw, 520px);
+      width: min(70vw, 520px);
+    }}
+    .panel {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }}
+    .status {{
+      color: #506178;
+      line-height: 1.45;
+      min-height: 44px;
+    }}
+    code {{
+      background: rgba(23, 32, 51, 0.08);
+      border-radius: 6px;
+      font-size: 14px;
+      padding: 8px 10px;
+      word-break: break-all;
+    }}
+    form {{
+      display: flex;
+      gap: 10px;
+    }}
+    input {{
+      border: 1px solid #b9c4d4;
+      border-radius: 8px;
+      font: inherit;
+      min-width: 0;
+      padding: 10px 12px;
+      width: 100%;
+    }}
+    button {{
+      background: #1769e0;
+      border: 0;
+      border-radius: 8px;
+      color: #ffffff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      padding: 10px 16px;
+    }}
+    button:disabled,
+    input:disabled {{
+      cursor: not-allowed;
+      opacity: 0.55;
+    }}
+    @media (max-width: 860px) {{
+      main {{
+        grid-template-columns: 1fr;
+        min-height: auto;
+      }}
+      .qr svg {{
+        height: min(82vw, 520px);
+        width: min(82vw, 520px);
+      }}
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{
+        background: #101522;
+        color: #eef3ff;
+      }}
+      .qr {{
+        background: #ffffff;
+        border-color: #2f3a4f;
+      }}
+      .status {{
+        color: #b9c4d4;
+      }}
+      code {{
+        background: rgba(238, 243, 255, 0.12);
+      }}
+      input {{
+        background: #171e2d;
+        border-color: #3a465c;
+        color: #eef3ff;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div id="toaster-root"></div>
+  <main>
+    <div class="qr">{self.qr_svg}</div>
+    <section class="panel">
+      <h1>ADB Wireless Debug</h1>
+      <div class="status" id="status">Scan the QR code on your Android device.</div>
+      <form id="connect-form">
+        <input id="port" name="port" inputmode="numeric" placeholder="5555" aria-label="Connect port" disabled>
+        <button id="submit" type="submit" disabled>Connect</button>
+      </form>
+      <code>{escape(self.text)}</code>
+    </section>
+  </main>
+  <script>
+    const form = document.querySelector("#connect-form");
+    const input = document.querySelector("#port");
+    const button = document.querySelector("#submit");
+    const statusEl = document.querySelector("#status");
+    const toasterRoot = document.querySelector("#toaster-root");
+    let toast = null;
+    let closing = false;
+
+    async function setupSonner() {{
+      try {{
+        const [React, ReactDOM, Sonner] = await Promise.all([
+          import("https://esm.sh/react@18"),
+          import("https://esm.sh/react-dom@18/client"),
+          import("https://esm.sh/sonner?deps=react@18,react-dom@18"),
+        ]);
+        ReactDOM.createRoot(toasterRoot).render(
+          React.createElement(Sonner.Toaster, {{
+            position: "top-center",
+            richColors: true,
+          }})
+        );
+        toast = Sonner.toast;
+      }} catch (error) {{
+        console.warn("Sonner toast could not be loaded", error);
+      }}
+    }}
+
+    setupSonner();
+
+    async function poll() {{
+      const response = await fetch("/state", {{ cache: "no-store" }});
+      const state = await response.json();
+      statusEl.textContent = state.deviceIp
+        ? `${{state.message}} (${{state.deviceIp}})`
+        : state.message;
+      input.disabled = !state.canSubmit;
+      button.disabled = !state.canSubmit;
+      if (state.canSubmit && document.activeElement !== input) {{
+        input.focus();
+      }}
+      if (state.done && !closing) {{
+        closing = true;
+        if (toast) {{
+          toast.success("连接成功", {{
+            description: "ADB wireless debugging connected.",
+            duration: 1600,
+          }});
+        }}
+        setTimeout(() => {{
+          window.open("", "_self");
+          window.close();
+        }}, 2200);
+      }}
+    }}
+
+    form.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      input.disabled = true;
+      button.disabled = true;
+      await fetch("/connect", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+        body: new URLSearchParams(new FormData(form)),
+      }});
+      poll();
+    }});
+
+    poll();
+    setInterval(poll, 800);
+  </script>
+</body>
+</html>
+"""
+
+
+def display_qr_code_browser(text, ttl_seconds=QR_CACHE_TTL_SECONDS):
+    """Generate a static QR code page and open it in a new browser window."""
+    qr_svg = build_qr_svg(text)
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -411,12 +805,10 @@ def main():
         arg = sys.argv[1].lower()
         if arg in ["-c", "--connect"]:
             mode = "connect"
-        elif arg in ["-p", "--pair-connect"]:
-            mode = "pair-connect"
-        elif arg in ["-s", "--reverse"]:
+        elif arg in ["-r", "--reverse"]:
             run_reverse()
             return
-        elif arg in ["-r", "--restart"]:
+        elif arg == "--restart":
             run_restart()
             return
         elif arg in ["-d", "--devices"]:
@@ -427,16 +819,13 @@ def main():
             print("\nUsage: python main.py [OPTIONS]")
             print("\nOptions:")
             print(
-                f"  {Colors.GREEN}-p, --pair-connect{Colors.RESET}  Scan QR to pair, then connect (default)"
-            )
-            print(
                 f"  {Colors.BLUE}-c, --connect{Colors.RESET}       Scan QR to get IP, then connect (for paired devices)"
             )
             print(
-                f"  {Colors.YELLOW}-s, --reverse{Colors.RESET}       Setup reverse port (tcp:8081) for selected device"
+                f"  {Colors.YELLOW}-r, --reverse{Colors.RESET}       Setup reverse port (tcp:8081) for selected device"
             )
             print(
-                f"  {Colors.YELLOW}-r, --restart{Colors.RESET}       Restart ADB server (kill-server && start-server)"
+                f"  {Colors.YELLOW}    --restart{Colors.RESET}       Restart ADB server (kill-server && start-server)"
             )
             print(
                 f"  {Colors.GREEN}-d, --devices{Colors.RESET}       List connected devices"
@@ -452,24 +841,38 @@ def main():
 
     qr_code_path = None
     qr_code_cleanup_timer = None
+    browser_session = None
     try:
-        qr_code_path, qr_code_cleanup_timer = display_qr_code_browser(text)
+        browser_session = BrowserPairingSession(text)
+        browser_url = browser_session.start()
+        opened = webbrowser.open_new(browser_url)
+        if opened:
+            print(f"{Colors.GREEN}✓ QR code opened in browser{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}Browser did not report a successful open{Colors.RESET}")
     except Exception as exc:
-        print(f"{Colors.YELLOW}Could not open QR code in browser: {exc}{Colors.RESET}")
+        browser_session = None
+        print(f"{Colors.YELLOW}Could not open interactive browser page: {exc}{Colors.RESET}")
+        try:
+            qr_code_path, qr_code_cleanup_timer = display_qr_code_browser(text)
+        except Exception as fallback_exc:
+            print(
+                f"{Colors.YELLOW}Could not open QR code in browser: {fallback_exc}{Colors.RESET}"
+            )
 
     display_qr_code(text)
 
     if mode == "pair-connect":
         print(f"\n{Colors.GREEN}Mode: Pair & Connect{Colors.RESET}")
         print("1. Scan QR code to pair new device")
-        print("2. Then enter port to connect\n")
+        print("2. Then enter the connect port in the browser\n")
         print(
             f"{Colors.YELLOW}Path: Developer options > Wireless debugging > Pair device with QR code{Colors.RESET}"
         )
     else:
         print(f"\n{Colors.BLUE}Mode: Connect Only{Colors.RESET}")
         print("1. Scan QR code to detect device IP")
-        print("2. Then enter port to connect\n")
+        print("2. Then enter the connect port in the browser\n")
         print(
             f"{Colors.YELLOW}Path: Developer options > Wireless debugging > Pair device with QR code{Colors.RESET}"
         )
@@ -480,6 +883,7 @@ def main():
         zeroconf_instance=zeroconf,
         qr_code_path=qr_code_path,
         qr_code_cleanup_timer=qr_code_cleanup_timer,
+        browser_session=browser_session,
     )
     browser = ServiceBrowser(zeroconf, TYPE_PAIRING, listener)
 
@@ -499,6 +903,11 @@ def main():
             zeroconf.close()
         except:
             pass
+        if browser_session:
+            import time
+
+            time.sleep(1.5)
+            browser_session.stop()
         print(f"\n{Colors.BLUE}Connected devices:{Colors.RESET}")
         subprocess.run(CMD_DEVICES, shell=True)
 

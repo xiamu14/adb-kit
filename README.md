@@ -21,8 +21,8 @@ Scans QR code and pairs the device, then auto-connects.
 1. Run the script with desired mode
 2. On your Android device:
    - Go to **Developer options** � **Wireless debugging** � **Pair device with QR code**
-3. Scan the QR code displayed in terminal
-4. If using pair-connect or connect mode, enter the connection port when prompted
+3. Scan the QR code displayed in the browser or terminal
+4. If using pair-connect or connect mode, enter the connection port in the browser page
 5. Press Enter to exit
 
 ## Requirements
@@ -41,7 +41,7 @@ uv sync
 
 ```bash
 $ uv run main.py
-[QR Code displayed]
+[QR Code opened in browser]
 Scan QR code to pair and connect.
 [Developer options]-[Wireless debugging]-[Pair device with QR code]
 
@@ -49,6 +49,7 @@ Service debug added.
 adb pair 192.168.1.100:37891 123456
 
 Pair successful!
+Enter the connect port in the browser page.
 Executing: adb connect 192.168.1.100:5555
 connected to 192.168.1.100:5555
 ```
