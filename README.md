@@ -4,9 +4,8 @@ Android 11+ wireless debugging tool with QR code pairing and auto-connect suppor
 
 ## Features
 
-- **Pair Only** (default): Scan QR code to pair device
-- **Pair and Connect**: Scan QR code to pair, then auto-connect with custom port
-- **Connect Only**: Skip pairing, just scan QR to get IP and connect
+- **Pair and Connect** (default): Scan QR code to pair, then auto-connect through mDNS
+- **Connect Only**: Skip pairing and connect to the discovered wireless debugging service
 
 ## Usage
 
@@ -22,8 +21,9 @@ Scans QR code and pairs the device, then auto-connects.
 2. On your Android device:
    - Go to **Developer options** � **Wireless debugging** � **Pair device with QR code**
 3. Scan the QR code displayed in the browser or terminal
-4. If using pair-connect or connect mode, enter the connection port in the browser page
-5. Press Enter to exit
+4. Wait for the wireless debugging connection port to be auto-discovered
+5. If auto-discovery does not appear, enter the connection port shown on the device in the browser page
+6. Press Enter to exit
 
 ## Requirements
 
@@ -49,7 +49,7 @@ Service debug added.
 adb pair 192.168.1.100:37891 123456
 
 Pair successful!
-Enter the connect port in the browser page.
-Executing: adb connect 192.168.1.100:5555
-connected to 192.168.1.100:5555
+Auto-discovered port 37123. Connecting...
+Executing: adb connect 192.168.1.100:37123
+connected to 192.168.1.100:37123
 ```

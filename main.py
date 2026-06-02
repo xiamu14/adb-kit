@@ -38,6 +38,7 @@ class Colors:
 
 
 TYPE_PAIRING = "_adb-tls-pairing._tcp.local."
+TYPE_CONNECT = "_adb-tls-connect._tcp.local."
 NAME = "debug"
 PASS = "123456"
 FORMAT_QR = "WIFI:T:ADB;S:%s;P:%s;;"
@@ -51,6 +52,7 @@ CMD_RESTART = "adb kill-server && adb start-server"
 PROJECT_DIR = Path(__file__).resolve().parent
 QR_CACHE_DIR = PROJECT_DIR / ".cache"
 QR_CACHE_TTL_SECONDS = 60
+AUTO_CONNECT_WAIT_SECONDS = 8
 
 
 class ADBListener:
@@ -72,6 +74,10 @@ class ADBListener:
         self.qr_code_cleanup_timer = qr_code_cleanup_timer
         self.browser_session = browser_session
         self.lock = threading.Lock()
+        self.pairing_started = False
+        self.paired = False
+        self.connect_started = False
+        self.pending_connect_service = None
 
     def remove_service(self, zeroconf, type, name):
         pass
@@ -81,39 +87,68 @@ class ADBListener:
 
     def add_service(self, zeroconf, type, name):
         with self.lock:
-            if self.done or self.device_ip:
+            if self.done:
                 return
 
         info = zeroconf.get_service_info(type, name)
         if not info:
             return
 
-        # Get actual IP address from addresses list
-        ip_address = None
-        if info.addresses:
-            import ipaddress
-
-            # Convert bytes to IP address string
-            ip_address = str(ipaddress.ip_address(info.addresses[0]))
+        ip_address = get_service_ip_address(info)
 
         print(f"\n{Colors.BLUE}Device found: {info.server}{Colors.RESET}")
+        print(f"{Colors.BLUE}Service type: {type}{Colors.RESET}")
         if ip_address:
             print(f"{Colors.BLUE}IP Address: {ip_address}{Colors.RESET}")
 
-        self.device_ip = ip_address or info.server
-        if self.browser_session:
-            self.browser_session.set_device_found(self.device_ip)
+        if type == TYPE_PAIRING:
+            if self.mode != "pair-connect":
+                return
+            with self.lock:
+                if self.pairing_started:
+                    return
+                self.pairing_started = True
 
-        if self.mode == "pair-connect":
+            self.device_ip = ip_address or info.server
+            if self.browser_session:
+                self.browser_session.set_device_found(self.device_ip)
+
             self.pair_then_connect(info, ip_address)
-        elif self.mode == "connect":
-            self.connect_only(info, ip_address)
+        elif type == TYPE_CONNECT:
+            self.connect_from_service(info, ip_address)
+
+    def connect_from_service(self, info, ip_address):
+        """Use the wireless debugging connect service when it is advertised."""
+        ip = ip_address or info.server
+        port = str(info.port)
+
+        with self.lock:
+            if self.connect_started:
+                return
+            if self.mode == "pair-connect" and not self.paired:
+                self.pending_connect_service = (ip, port)
+                return
+            if self.mode == "connect":
+                self.connect_started = True
+
+        if self.mode == "connect":
+            self.run_connect(ip, port)
+            return
+
+        if self.browser_session:
+            self.browser_session.set_auto_connect_port(ip, port)
+        else:
+            with self.lock:
+                if self.connect_started:
+                    return
+                self.connect_started = True
+            self.run_connect(ip, port)
 
     def pair_then_connect(self, info, ip_address):
-        """Pair device and then prompt for connect"""
+        """Pair device and then connect with browser-entered or discovered port."""
         import sys
 
-        cmd = CMD_PAIR % (info.server, info.port, PASS)
+        cmd = CMD_PAIR % (ip_address or info.server, info.port, PASS)
         print(f"{Colors.YELLOW}Pairing...{Colors.RESET}\n")
         if self.browser_session:
             self.browser_session.set_pairing()
@@ -130,9 +165,22 @@ class ADBListener:
             print(
                 f"{Colors.BLUE}Ready to connect to: {ip_address or info.server}{Colors.RESET}\n"
             )
-            if self.browser_session:
-                self.browser_session.set_paired(ip_address or info.server)
             sys.stdout.flush()
+
+            with self.lock:
+                self.paired = True
+                pending_connect_service = self.pending_connect_service
+
+            if pending_connect_service:
+                pending_ip, pending_port = pending_connect_service
+                if self.browser_session:
+                    self.browser_session.set_auto_connect_port(
+                        pending_ip, pending_port
+                    )
+                else:
+                    self.run_connect(pending_ip, pending_port)
+                    return
+
             self.prompt_connect(ip_address or info.server)
         else:
             print(f"\n{Colors.RED}✗ Pairing failed{Colors.RESET}")
@@ -143,28 +191,28 @@ class ADBListener:
                 self.zeroconf.close()
 
     def connect_only(self, info, ip_address):
-        """Connect to already paired device (only IP available from QR scan)"""
-        ip = ip_address or info.server
-        if self.browser_session:
-            self.browser_session.set_ready_to_connect(ip)
-        self.prompt_connect(ip)
+        """Connect to already paired device with browser-entered or discovered port."""
+        self.prompt_connect(ip_address or info.server)
 
     def prompt_connect(self, ip):
-        """Prompt user for connect port and execute adb connect"""
+        """Prompt user for connect port and execute adb connect."""
         import sys
         import time
 
         try:
-            # Small delay to ensure all output is flushed
             time.sleep(0.2)
             sys.stdout.flush()
             sys.stderr.flush()
 
             if self.browser_session:
                 print(
-                    f"{Colors.BOLD}Enter connect port in the browser page (default 5555).{Colors.RESET}"
+                    f"{Colors.BOLD}Waiting for auto-discovered connect port. Browser input is fallback only.{Colors.RESET}"
                 )
-                port = self.browser_session.wait_for_connect_port()
+                self.browser_session.set_paired(ip)
+                connect_ip, port = self.browser_session.wait_for_connect_target(
+                    fallback_delay_seconds=AUTO_CONNECT_WAIT_SECONDS
+                )
+                ip = connect_ip or ip
             else:
                 port = input(
                     f"{Colors.BOLD}Enter connect port (default 5555): {Colors.RESET}"
@@ -172,18 +220,50 @@ class ADBListener:
             if not port:
                 port = "5555"
 
+            with self.lock:
+                if self.connect_started:
+                    return
+                self.connect_started = True
+
+            self.run_connect(ip, port)
+
+        except KeyboardInterrupt:
+            print(f"\n{Colors.RED}Cancelled{Colors.RESET}\n")
+            if self.browser_session:
+                self.browser_session.set_error("Cancelled")
+            self.done = True
+            if self.zeroconf:
+                self.zeroconf.close()
+
+    def run_connect(self, ip, port):
+        """Execute adb connect with the discovered wireless debugging port."""
+        import sys
+        import time
+
+        try:
+            time.sleep(0.2)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
             print(f"\n{Colors.YELLOW}Connecting to {ip}:{port}...{Colors.RESET}\n")
             if self.browser_session:
                 self.browser_session.set_connecting(ip, port)
             sys.stdout.flush()
 
             cmd = CMD_CONNECT % (ip, port)
-            result = subprocess.run(cmd, shell=True)
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
 
             sys.stdout.flush()
             sys.stderr.flush()
 
-            if result.returncode == 0:
+            if result.returncode == 0 and is_adb_connect_success(
+                result.stdout + result.stderr
+            ):
                 print(f"{Colors.GREEN}✓ Connected successfully{Colors.RESET}\n")
                 if self.browser_session:
                     self.browser_session.set_connected()
@@ -208,6 +288,25 @@ class ADBListener:
             self.done = True
             if self.zeroconf:
                 self.zeroconf.close()
+
+
+def get_service_ip_address(info):
+    """Return the first IP address advertised by a zeroconf service."""
+    if not info.addresses:
+        return None
+
+    import ipaddress
+
+    addresses = [ipaddress.ip_address(address) for address in info.addresses]
+    for address in addresses:
+        if address.version == 4:
+            return str(address)
+    return str(addresses[0])
+
+
+def is_adb_connect_success(output):
+    output = output.lower()
+    return "connected to" in output or "already connected to" in output
 
 
 def display_qr_code(text):
@@ -265,7 +364,7 @@ class BrowserPairingSession:
     def __init__(self, text):
         self.text = text
         self.qr_svg = build_qr_svg(text)
-        self.port_queue = Queue(maxsize=1)
+        self.connect_target_queue = Queue(maxsize=1)
         self.lock = threading.Lock()
         self.state = {
             "status": "waiting",
@@ -352,17 +451,26 @@ class BrowserPairingSession:
     def set_paired(self, ip):
         self.update(
             status="paired",
-            message="Paired successfully. Enter the connect port.",
+            message="Paired successfully. Waiting for wireless connection port...",
             deviceIp=ip,
-            canSubmit=True,
+            canSubmit=False,
         )
 
     def set_ready_to_connect(self, ip):
         self.update(
             status="ready",
-            message="Device found. Enter the connect port.",
+            message="Device found. Waiting for wireless connection port...",
             deviceIp=ip,
-            canSubmit=True,
+            canSubmit=False,
+        )
+
+    def set_auto_connect_port(self, ip, port):
+        self.submit_port(port, ip)
+        self.update(
+            status="auto_port_found",
+            message=f"Auto-discovered port {port}. Connecting...",
+            deviceIp=ip,
+            canSubmit=False,
         )
 
     def set_connecting(self, ip, port):
@@ -383,22 +491,40 @@ class BrowserPairingSession:
     def set_error(self, message):
         self.update(status="error", message=message, error=message, canSubmit=False)
 
-    def submit_port(self, port):
+    def submit_port(self, port, ip=None):
         try:
-            self.port_queue.put_nowait(port)
+            self.connect_target_queue.put_nowait((ip, port))
         except Exception:
             pass
         self.update(canSubmit=False, message="Port submitted. Connecting...")
 
-    def wait_for_connect_port(self):
-        self.update(canSubmit=True)
+    def wait_for_connect_target(self, fallback_delay_seconds=0):
+        fallback_started = False
+        deadline = None
+        if fallback_delay_seconds:
+            import time
+
+            deadline = time.monotonic() + fallback_delay_seconds
+        else:
+            fallback_started = True
+            self.update(canSubmit=True)
+
         while True:
             try:
-                return self.port_queue.get(timeout=0.5)
+                return self.connect_target_queue.get(timeout=0.5)
             except Empty:
                 state = self.snapshot()
                 if state.get("done") or state.get("error"):
                     raise KeyboardInterrupt
+                if deadline and not fallback_started:
+                    import time
+
+                    if time.monotonic() >= deadline:
+                        fallback_started = True
+                        self.update(
+                            message="Auto-discovery is still pending. Enter the port shown on the device if needed.",
+                            canSubmit=True,
+                        )
 
     def render_html(self):
         return f"""<!doctype html>
@@ -865,16 +991,16 @@ def main():
     if mode == "pair-connect":
         print(f"\n{Colors.GREEN}Mode: Pair & Connect{Colors.RESET}")
         print("1. Scan QR code to pair new device")
-        print("2. Then enter the connect port in the browser\n")
+        print("2. Then wait for the connect port to be auto-discovered\n")
         print(
             f"{Colors.YELLOW}Path: Developer options > Wireless debugging > Pair device with QR code{Colors.RESET}"
         )
     else:
         print(f"\n{Colors.BLUE}Mode: Connect Only{Colors.RESET}")
-        print("1. Scan QR code to detect device IP")
-        print("2. Then enter the connect port in the browser\n")
+        print("1. Make sure Wireless debugging is enabled")
+        print("2. Then wait for the connect port to be auto-discovered\n")
         print(
-            f"{Colors.YELLOW}Path: Developer options > Wireless debugging > Pair device with QR code{Colors.RESET}"
+            f"{Colors.YELLOW}Path: Developer options > Wireless debugging{Colors.RESET}"
         )
 
     zeroconf = Zeroconf()
@@ -885,7 +1011,7 @@ def main():
         qr_code_cleanup_timer=qr_code_cleanup_timer,
         browser_session=browser_session,
     )
-    browser = ServiceBrowser(zeroconf, TYPE_PAIRING, listener)
+    browser = ServiceBrowser(zeroconf, [TYPE_PAIRING, TYPE_CONNECT], listener)
 
     print(f"\n{Colors.BOLD}Waiting for device...{Colors.RESET}")
     print(f"{Colors.YELLOW}(Press Ctrl+C to exit){Colors.RESET}\n")
