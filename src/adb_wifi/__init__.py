@@ -11,6 +11,7 @@ qrcode: Pure python QR Code generator
 https://github.com/lincolnloop/python-qrcode
 """
 
+import argparse
 import subprocess
 import tempfile
 import threading
@@ -46,13 +47,15 @@ FORMAT_QR = "WIFI:T:ADB;S:%s;P:%s;;"
 CMD_PAIR = "adb pair %s:%s %s"
 CMD_CONNECT = "adb connect %s:%s"
 CMD_DEVICES = "adb devices -l"
-CMD_REVERSE = "adb -s %s reverse tcp:8081 tcp:8081"
 CMD_RESTART = "adb kill-server && adb start-server"
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[2]
 QR_CACHE_DIR = PROJECT_DIR / ".cache"
 QR_CACHE_TTL_SECONDS = 60
 AUTO_CONNECT_WAIT_SECONDS = 8
+AUTO_CONNECT_FAILED_MESSAGE = (
+    "Could not auto-discover the port. Run ak restart, then try ak wireless again."
+)
 
 
 class ADBListener:
@@ -206,7 +209,7 @@ class ADBListener:
 
             if self.browser_session:
                 print(
-                    f"{Colors.BOLD}Waiting for auto-discovered connect port. Browser input is fallback only.{Colors.RESET}"
+                    f"{Colors.BOLD}Waiting for auto-discovered connect port...{Colors.RESET}"
                 )
                 self.browser_session.set_paired(ip)
                 connect_ip, port = self.browser_session.wait_for_connect_target(
@@ -214,12 +217,7 @@ class ADBListener:
                 )
                 ip = connect_ip or ip
             else:
-                port = input(
-                    f"{Colors.BOLD}Enter connect port (default 5555): {Colors.RESET}"
-                ).strip()
-            if not port:
-                port = "5555"
-
+                raise TimeoutError
             with self.lock:
                 if self.connect_started:
                     return
@@ -227,6 +225,13 @@ class ADBListener:
 
             self.run_connect(ip, port)
 
+        except TimeoutError:
+            print(f"\n{Colors.RED}{AUTO_CONNECT_FAILED_MESSAGE}{Colors.RESET}\n")
+            if self.browser_session:
+                self.browser_session.set_error(AUTO_CONNECT_FAILED_MESSAGE)
+            self.done = True
+            if self.zeroconf:
+                self.zeroconf.close()
         except KeyboardInterrupt:
             print(f"\n{Colors.RED}Cancelled{Colors.RESET}\n")
             if self.browser_session:
@@ -373,6 +378,7 @@ class BrowserPairingSession:
             "canSubmit": False,
             "done": False,
             "error": "",
+            "closeAfterMs": 0,
         }
         self.server = None
         self.thread = None
@@ -488,8 +494,14 @@ class BrowserPairingSession:
             done=True,
         )
 
-    def set_error(self, message):
-        self.update(status="error", message=message, error=message, canSubmit=False)
+    def set_error(self, message, close_after_ms=0):
+        self.update(
+            status="error",
+            message=message,
+            error=message,
+            canSubmit=False,
+            closeAfterMs=close_after_ms,
+        )
 
     def submit_port(self, port, ip=None):
         try:
@@ -507,7 +519,7 @@ class BrowserPairingSession:
             deadline = time.monotonic() + fallback_delay_seconds
         else:
             fallback_started = True
-            self.update(canSubmit=True)
+            self.update(canSubmit=False)
 
         while True:
             try:
@@ -521,10 +533,8 @@ class BrowserPairingSession:
 
                     if time.monotonic() >= deadline:
                         fallback_started = True
-                        self.update(
-                            message="Auto-discovery is still pending. Enter the port shown on the device if needed.",
-                            canSubmit=True,
-                        )
+                        self.set_error(AUTO_CONNECT_FAILED_MESSAGE, close_after_ms=5000)
+                        raise TimeoutError
 
     def render_html(self):
         return f"""<!doctype html>
@@ -546,9 +556,10 @@ class BrowserPairingSession:
     }}
     main {{
       align-items: center;
-      display: grid;
-      gap: 22px;
-      grid-template-columns: minmax(280px, 520px) minmax(280px, 380px);
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
       justify-content: center;
       min-height: 100vh;
       padding: 32px;
@@ -563,65 +574,37 @@ class BrowserPairingSession:
       border: 1px solid #d9e0ec;
       border-radius: 8px;
       box-shadow: 0 18px 60px rgba(23, 32, 51, 0.16);
-      padding: 24px;
+      align-items: center;
+      box-sizing: border-box;
+      display: flex;
+      justify-content: center;
+      padding: 16px;
     }}
     .qr svg {{
       display: block;
-      height: min(70vw, 520px);
-      width: min(70vw, 520px);
+      height: min(68vw, 520px);
+      width: min(68vw, 520px);
     }}
     .panel {{
+      align-items: center;
       display: flex;
       flex-direction: column;
       gap: 14px;
+      text-align: center;
+      width: min(86vw, 640px);
     }}
     .status {{
       color: #506178;
       line-height: 1.45;
       min-height: 44px;
     }}
-    code {{
-      background: rgba(23, 32, 51, 0.08);
-      border-radius: 6px;
-      font-size: 14px;
-      padding: 8px 10px;
-      word-break: break-all;
-    }}
-    form {{
-      display: flex;
-      gap: 10px;
-    }}
-    input {{
-      border: 1px solid #b9c4d4;
-      border-radius: 8px;
-      font: inherit;
-      min-width: 0;
-      padding: 10px 12px;
-      width: 100%;
-    }}
-    button {{
-      background: #1769e0;
-      border: 0;
-      border-radius: 8px;
-      color: #ffffff;
-      cursor: pointer;
-      font: inherit;
-      font-weight: 700;
-      padding: 10px 16px;
-    }}
-    button:disabled,
-    input:disabled {{
-      cursor: not-allowed;
-      opacity: 0.55;
-    }}
     @media (max-width: 860px) {{
       main {{
-        grid-template-columns: 1fr;
         min-height: auto;
       }}
       .qr svg {{
-        height: min(82vw, 520px);
-        width: min(82vw, 520px);
+        height: min(72vw, 520px);
+        width: min(72vw, 520px);
       }}
     }}
     @media (prefers-color-scheme: dark) {{
@@ -636,14 +619,6 @@ class BrowserPairingSession:
       .status {{
         color: #b9c4d4;
       }}
-      code {{
-        background: rgba(238, 243, 255, 0.12);
-      }}
-      input {{
-        background: #171e2d;
-        border-color: #3a465c;
-        color: #eef3ff;
-      }}
     }}
   </style>
 </head>
@@ -654,17 +629,9 @@ class BrowserPairingSession:
     <section class="panel">
       <h1>ADB Wireless Debug</h1>
       <div class="status" id="status">Scan the QR code on your Android device.</div>
-      <form id="connect-form">
-        <input id="port" name="port" inputmode="numeric" placeholder="5555" aria-label="Connect port" disabled>
-        <button id="submit" type="submit" disabled>Connect</button>
-      </form>
-      <code>{escape(self.text)}</code>
     </section>
   </main>
   <script>
-    const form = document.querySelector("#connect-form");
-    const input = document.querySelector("#port");
-    const button = document.querySelector("#submit");
     const statusEl = document.querySelector("#status");
     const toasterRoot = document.querySelector("#toaster-root");
     let toast = null;
@@ -697,10 +664,12 @@ class BrowserPairingSession:
       statusEl.textContent = state.deviceIp
         ? `${{state.message}} (${{state.deviceIp}})`
         : state.message;
-      input.disabled = !state.canSubmit;
-      button.disabled = !state.canSubmit;
-      if (state.canSubmit && document.activeElement !== input) {{
-        input.focus();
+      if (state.closeAfterMs && !closing) {{
+        closing = true;
+        setTimeout(() => {{
+          window.open("", "_self");
+          window.close();
+        }}, state.closeAfterMs);
       }}
       if (state.done && !closing) {{
         closing = true;
@@ -716,18 +685,6 @@ class BrowserPairingSession:
         }}, 2200);
       }}
     }}
-
-    form.addEventListener("submit", async (event) => {{
-      event.preventDefault();
-      input.disabled = true;
-      button.disabled = true;
-      await fetch("/connect", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-        body: new URLSearchParams(new FormData(form)),
-      }});
-      poll();
-    }});
 
     poll();
     setInterval(poll, 800);
@@ -881,20 +838,30 @@ def select_device(devices):
         return None
 
 
-def run_reverse():
+def build_reverse_cmd(device, local_port, remote_port):
+    return [
+        "adb",
+        "-s",
+        device,
+        "reverse",
+        f"tcp:{local_port}",
+        f"tcp:{remote_port}",
+    ]
+
+
+def run_reverse(device, local_port, remote_port):
     """Run adb reverse command for selected device."""
     print(f"\n{Colors.BOLD}=== ADB Reverse ==={Colors.RESET}\n")
 
-    devices = get_connected_devices()
-    device = select_device(devices)
-
     if not device:
-        return
+        device = select_device(get_connected_devices())
+        if not device:
+            return
 
-    cmd = CMD_REVERSE % device
-    print(f"\n{Colors.YELLOW}Running: {cmd}{Colors.RESET}\n")
+    cmd = build_reverse_cmd(device, local_port, remote_port)
+    print(f"\n{Colors.YELLOW}Running: {' '.join(cmd)}{Colors.RESET}\n")
 
-    result = subprocess.run(cmd, shell=True)
+    result = subprocess.run(cmd)
 
     if result.returncode == 0:
         print(f"{Colors.GREEN}✓ Reverse port mapping established{Colors.RESET}")
@@ -921,45 +888,8 @@ def run_devices():
     subprocess.run(CMD_DEVICES, shell=True)
 
 
-def main():
-    import sys
-
+def run_wireless():
     mode = "pair-connect"
-
-    # Parse command line arguments
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if arg in ["-c", "--connect"]:
-            mode = "connect"
-        elif arg in ["-r", "--reverse"]:
-            run_reverse()
-            return
-        elif arg == "--restart":
-            run_restart()
-            return
-        elif arg in ["-d", "--devices"]:
-            run_devices()
-            return
-        elif arg in ["-h", "--help"]:
-            print(f"\n{Colors.BOLD}ADB Wireless Debug Helper{Colors.RESET}")
-            print("\nUsage: python main.py [OPTIONS]")
-            print("\nOptions:")
-            print(
-                f"  {Colors.BLUE}-c, --connect{Colors.RESET}       Scan QR to get IP, then connect (for paired devices)"
-            )
-            print(
-                f"  {Colors.YELLOW}-r, --reverse{Colors.RESET}       Setup reverse port (tcp:8081) for selected device"
-            )
-            print(
-                f"  {Colors.YELLOW}    --restart{Colors.RESET}       Restart ADB server (kill-server && start-server)"
-            )
-            print(
-                f"  {Colors.GREEN}-d, --devices{Colors.RESET}       List connected devices"
-            )
-            print(
-                f"  {Colors.YELLOW}-h, --help{Colors.RESET}          Show this help message"
-            )
-            return
 
     text = FORMAT_QR % (NAME, PASS)
 
@@ -1038,5 +968,44 @@ def main():
         subprocess.run(CMD_DEVICES, shell=True)
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="ak")
+    parser.add_argument("command", nargs="?", choices=["restart", "wireless"])
+    parser.add_argument("-s", "--serial", nargs="?", const="")
+    parser.add_argument(
+        "-r",
+        "--reverse",
+        nargs="+",
+        type=int,
+        metavar="PORT",
+        help="reverse LOCAL [REMOTE], defaults REMOTE to LOCAL",
+    )
+    args = parser.parse_args(argv)
+
+    if args.reverse is not None:
+        if args.command:
+            parser.error("-r cannot be combined with a command")
+        if args.serial is None:
+            parser.error("-s is required with -r")
+        if len(args.reverse) not in (1, 2):
+            parser.error("-r expects LOCAL [REMOTE]")
+        local_port = args.reverse[0]
+        remote_port = args.reverse[-1]
+        run_reverse(args.serial, local_port, remote_port)
+        return 0
+
+    if args.serial is not None:
+        parser.error("-s is only valid with -r")
+    if args.command == "restart":
+        run_restart()
+        return 0
+    if args.command == "wireless":
+        run_wireless()
+        return 0
+
+    parser.print_help()
+    return 2
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

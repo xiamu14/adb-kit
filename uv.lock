@@ -5,7 +5,7 @@ requires-python = ">=3.9"
 [[package]]
 name = "adb-wifi"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "qrcode" },
     { name = "zeroconf" },

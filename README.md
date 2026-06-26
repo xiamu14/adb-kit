@@ -10,10 +10,16 @@ Android 11+ wireless debugging tool with QR code pairing and auto-connect suppor
 ## Usage
 
 ```bash
-uv run main.py
+uv run ak wireless
 ```
 
 Scans QR code and pairs the device, then auto-connects.
+
+```bash
+uv run ak restart
+uv run ak -s -r 8081
+uv run ak -s <device> -r 9091
+```
 
 ## Steps
 
@@ -40,7 +46,7 @@ uv sync
 ## Example
 
 ```bash
-$ uv run main.py
+$ uv run ak wireless
 [QR Code opened in browser]
 Scan QR code to pair and connect.
 [Developer options]-[Wireless debugging]-[Pair device with QR code]
