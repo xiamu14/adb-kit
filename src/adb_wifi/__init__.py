@@ -849,6 +849,10 @@ def build_reverse_cmd(device, local_port, remote_port):
     ]
 
 
+def build_reverse_list_cmd(device):
+    return ["adb", "-s", device, "reverse", "--list"]
+
+
 def run_reverse(device, local_port, remote_port):
     """Run adb reverse command for selected device."""
     print(f"\n{Colors.BOLD}=== ADB Reverse ==={Colors.RESET}\n")
@@ -867,6 +871,22 @@ def run_reverse(device, local_port, remote_port):
         print(f"{Colors.GREEN}✓ Reverse port mapping established{Colors.RESET}")
     else:
         print(f"{Colors.RED}✗ Reverse failed{Colors.RESET}")
+
+
+def run_reverse_list(device):
+    """List adb reverse mappings."""
+    devices = [device] if device else get_connected_devices()
+    if device == "":
+        selected = select_device(devices)
+        devices = [selected] if selected else []
+
+    if not devices:
+        print(f"{Colors.RED}No connected devices found{Colors.RESET}")
+        return
+
+    for current_device in devices:
+        print(f"\n{Colors.BOLD}=== Reverse: {current_device} ==={Colors.RESET}\n")
+        subprocess.run(build_reverse_list_cmd(current_device))
 
 
 def run_restart():
@@ -969,22 +989,48 @@ def run_wireless():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="ak")
-    parser.add_argument("command", nargs="?", choices=["restart", "wireless"])
-    parser.add_argument("-s", "--serial", nargs="?", const="")
+    parser = argparse.ArgumentParser(
+        prog="ak",
+        usage="ak wireless | ak restart | ak devices | ak [-s [DEVICE]] -r PORT [REMOTE] | ak [-s [DEVICE]] -r --list",
+        description="Small ADB shortcut tool.",
+        epilog=(
+            "Examples:\n"
+            "  ak wireless              pair/connect wireless debugging\n"
+            "  ak restart               restart adb server\n"
+            "  ak devices               list connected devices\n"
+            "  ak -s -r 8081            choose device, reverse 8081 -> 8081\n"
+            "  ak -s DEVICE -r 9091     reverse DEVICE 9091 -> 9091\n"
+            "  ak -s -r --list          choose device, show reverse mappings\n"
+            "  ak -r --list             show reverse mappings for all devices"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("command", nargs="?", choices=["restart", "wireless", "devices"], help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-s",
+        "--serial",
+        nargs="?",
+        const="",
+        metavar="DEVICE",
+        help="device id; omit DEVICE after -s to choose interactively",
+    )
     parser.add_argument(
         "-r",
         "--reverse",
-        nargs="+",
+        nargs="*",
         type=int,
         metavar="PORT",
-        help="reverse LOCAL [REMOTE], defaults REMOTE to LOCAL",
+        help="reverse port; one port means phone:PORT -> computer:PORT",
     )
+    parser.add_argument("--list", action="store_true", help="show current reverse mappings")
     args = parser.parse_args(argv)
 
     if args.reverse is not None:
         if args.command:
             parser.error("-r cannot be combined with a command")
+        if args.list:
+            run_reverse_list(args.serial)
+            return 0
         if args.serial is None:
             parser.error("-s is required with -r")
         if len(args.reverse) not in (1, 2):
@@ -996,8 +1042,13 @@ def main(argv=None):
 
     if args.serial is not None:
         parser.error("-s is only valid with -r")
+    if args.list:
+        parser.error("--list is only valid with -r")
     if args.command == "restart":
         run_restart()
+        return 0
+    if args.command == "devices":
+        run_devices()
         return 0
     if args.command == "wireless":
         run_wireless()

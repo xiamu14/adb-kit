@@ -17,8 +17,11 @@ Scans QR code and pairs the device, then auto-connects.
 
 ```bash
 uv run ak restart
+uv run ak devices
 uv run ak -s -r 8081
 uv run ak -s <device> -r 9091
+uv run ak -s -r --list
+uv run ak -r --list
 ```
 
 ## Steps
