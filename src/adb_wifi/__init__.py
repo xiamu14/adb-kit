@@ -47,6 +47,7 @@ FORMAT_QR = "WIFI:T:ADB;S:%s;P:%s;;"
 CMD_PAIR = "adb pair %s:%s %s"
 CMD_CONNECT = "adb connect %s:%s"
 CMD_DEVICES = "adb devices -l"
+CMD_MDNS_SERVICES = "adb mdns services"
 CMD_RESTART = "adb kill-server && adb start-server"
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -80,13 +81,12 @@ class ADBListener:
         self.pairing_started = False
         self.paired = False
         self.connect_started = False
-        self.pending_connect_service = None
 
     def remove_service(self, zeroconf, type, name):
         pass
 
     def update_service(self, zeroconf, type, name):
-        pass
+        self.add_service(zeroconf, type, name)
 
     def add_service(self, zeroconf, type, name):
         with self.lock:
@@ -118,7 +118,22 @@ class ADBListener:
 
             self.pair_then_connect(info, ip_address)
         elif type == TYPE_CONNECT:
+            if is_duplicate_mdns_instance(name):
+                return
             self.connect_from_service(info, ip_address)
+
+    def refresh_adb_mdns_connect_target(self, ip):
+        result = subprocess.run(
+            CMD_MDNS_SERVICES, shell=True, capture_output=True, text=True
+        )
+        target = parse_adb_mdns_connect_target(result.stdout + result.stderr, ip)
+        if not target:
+            return
+        connect_ip, port = target
+        if self.browser_session:
+            self.browser_session.set_auto_connect_port(connect_ip, port)
+        else:
+            self.run_connect(connect_ip, port)
 
     def connect_from_service(self, info, ip_address):
         """Use the wireless debugging connect service when it is advertised."""
@@ -129,7 +144,6 @@ class ADBListener:
             if self.connect_started:
                 return
             if self.mode == "pair-connect" and not self.paired:
-                self.pending_connect_service = (ip, port)
                 return
             if self.mode == "connect":
                 self.connect_started = True
@@ -172,18 +186,8 @@ class ADBListener:
 
             with self.lock:
                 self.paired = True
-                pending_connect_service = self.pending_connect_service
 
-            if pending_connect_service:
-                pending_ip, pending_port = pending_connect_service
-                if self.browser_session:
-                    self.browser_session.set_auto_connect_port(
-                        pending_ip, pending_port
-                    )
-                else:
-                    self.run_connect(pending_ip, pending_port)
-                    return
-
+            self.refresh_adb_mdns_connect_target(ip_address or info.server)
             self.prompt_connect(ip_address or info.server)
         else:
             print(f"\n{Colors.RED}✗ Pairing failed{Colors.RESET}")
@@ -213,7 +217,8 @@ class ADBListener:
                 )
                 self.browser_session.set_paired(ip)
                 connect_ip, port = self.browser_session.wait_for_connect_target(
-                    fallback_delay_seconds=AUTO_CONNECT_WAIT_SECONDS
+                    fallback_delay_seconds=AUTO_CONNECT_WAIT_SECONDS,
+                    refresh=lambda: self.refresh_adb_mdns_connect_target(ip),
                 )
                 ip = connect_ip or ip
             else:
@@ -307,6 +312,39 @@ def get_service_ip_address(info):
         if address.version == 4:
             return str(address)
     return str(addresses[0])
+
+
+def is_duplicate_mdns_instance(name):
+    instance = name.split("._adb-", 1)[0]
+    suffix = instance.rsplit(" ", 1)[-1]
+    return suffix.startswith("(") and suffix.endswith(")") and suffix[1:-1].isdigit()
+
+
+def parse_adb_mdns_connect_target(output, ip):
+    service_type = TYPE_CONNECT.replace(".local.", "")
+
+    for line in output.splitlines():
+        parts = line.split()
+        if service_type not in parts:
+            continue
+
+        service_index = parts.index(service_type)
+        if service_index + 1 >= len(parts):
+            continue
+
+        address = parts[service_index + 1]
+        if ":" not in address:
+            continue
+
+        host, port = address.rsplit(":", 1)
+        if ip and host != ip:
+            continue
+
+        target = (host, port)
+        if not is_duplicate_mdns_instance(" ".join(parts[:service_index])):
+            return target
+
+    return None
 
 
 def is_adb_connect_success(output):
@@ -494,7 +532,7 @@ class BrowserPairingSession:
             done=True,
         )
 
-    def set_error(self, message, close_after_ms=0):
+    def set_error(self, message, close_after_ms=3000):
         self.update(
             status="error",
             message=message,
@@ -504,13 +542,15 @@ class BrowserPairingSession:
         )
 
     def submit_port(self, port, ip=None):
-        try:
-            self.connect_target_queue.put_nowait((ip, port))
-        except Exception:
-            pass
+        while True:
+            try:
+                self.connect_target_queue.get_nowait()
+            except Empty:
+                break
+        self.connect_target_queue.put_nowait((ip, port))
         self.update(canSubmit=False, message="Port submitted. Connecting...")
 
-    def wait_for_connect_target(self, fallback_delay_seconds=0):
+    def wait_for_connect_target(self, fallback_delay_seconds=0, refresh=None):
         fallback_started = False
         deadline = None
         if fallback_delay_seconds:
@@ -522,6 +562,8 @@ class BrowserPairingSession:
             self.update(canSubmit=False)
 
         while True:
+            if refresh:
+                refresh()
             try:
                 return self.connect_target_queue.get(timeout=0.5)
             except Empty:
@@ -533,7 +575,7 @@ class BrowserPairingSession:
 
                     if time.monotonic() >= deadline:
                         fallback_started = True
-                        self.set_error(AUTO_CONNECT_FAILED_MESSAGE, close_after_ms=5000)
+                        self.set_error(AUTO_CONNECT_FAILED_MESSAGE)
                         raise TimeoutError
 
     def render_html(self):
@@ -598,6 +640,10 @@ class BrowserPairingSession:
       line-height: 1.45;
       min-height: 44px;
     }}
+    .status.error {{
+      color: #dc2626;
+      font-weight: 600;
+    }}
     @media (max-width: 860px) {{
       main {{
         min-height: auto;
@@ -618,6 +664,9 @@ class BrowserPairingSession:
       }}
       .status {{
         color: #b9c4d4;
+      }}
+      .status.error {{
+        color: #f87171;
       }}
     }}
   </style>
@@ -664,6 +713,7 @@ class BrowserPairingSession:
       statusEl.textContent = state.deviceIp
         ? `${{state.message}} (${{state.deviceIp}})`
         : state.message;
+      statusEl.classList.toggle("error", state.status === "error");
       if (state.closeAfterMs && !closing) {{
         closing = true;
         setTimeout(() => {{
