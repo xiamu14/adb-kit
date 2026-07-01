@@ -6,6 +6,7 @@ from adb_wifi import (
     BrowserPairingSession,
     TYPE_CONNECT,
     is_duplicate_mdns_instance,
+    main,
     parse_adb_mdns_connect_target,
 )
 
@@ -105,6 +106,15 @@ adb-10AF9Y26XS002M3-s7MtH6\t_adb-tls-connect._tcp\t192.168.1.108:44401
     def test_duplicate_mdns_instance_detection(self):
         self.assertTrue(is_duplicate_mdns_instance("adb-serial (2)._adb-tls-connect._tcp.local."))
         self.assertFalse(is_duplicate_mdns_instance("adb-serial._adb-tls-connect._tcp.local."))
+
+    def test_wireless_restarts_adb_first(self):
+        calls = []
+
+        with patch("adb_wifi.run_restart", side_effect=lambda: calls.append("restart")):
+            with patch("adb_wifi.run_wireless", side_effect=lambda: calls.append("wireless")):
+                self.assertEqual(0, main(["wireless"]))
+
+        self.assertEqual(["restart", "wireless"], calls)
 
 
 if __name__ == "__main__":

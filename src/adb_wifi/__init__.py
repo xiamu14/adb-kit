@@ -55,7 +55,7 @@ QR_CACHE_DIR = PROJECT_DIR / ".cache"
 QR_CACHE_TTL_SECONDS = 60
 AUTO_CONNECT_WAIT_SECONDS = 8
 AUTO_CONNECT_FAILED_MESSAGE = (
-    "Could not auto-discover the port. Run ak restart, then try ak wireless again."
+    "Could not auto-discover the port. Check Wireless debugging, then try ak wireless again."
 )
 
 
@@ -1101,6 +1101,7 @@ def main(argv=None):
         run_devices()
         return 0
     if args.command == "wireless":
+        run_restart()
         run_wireless()
         return 0
 
